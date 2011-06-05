@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use 5.010001;
+
+package App::mixi2gmail;
+use Mouse;
+
+use Config::Pit;
+use DBI;
+use Data::Dumper;
+use Email::MIME::CreateHTML;
+use Email::MIME;
+use Email::Sender::Simple qw(sendmail);
+use Email::Sender::Transport::SMTP;
+use Email::Simple::Creator;
+use Email::Simple;
+use Encode;
+use File::HomeDir;
+use Getopt::Long;
+use Text::Xslate;
+use WWW::Mixi::Scraper;
+
+has config_mixi => (
+    is => 'ro',
+    isa => 'HashRef',
+    lazy => 1,
+    default => sub {
+        my $config = pit_get(
+            "mixi.jp",
+            require => {
+                "email" => "your username on example",
+                "password" => "your password on example"
+            }
+        );
+    },
+);
+
+has 'xslate' => (
+    is      => 'ro',
+    lazy    => 1,
+    default => sub {
+        Text::Xslate->new(
+            syntax => 'TTerse',
+            module => [ 'Text::Xslate::Bridge::TT2Like' ],
+
+        );
+    },
+);
+
+has config_gmail => (
+    is => 'ro',
+    isa => 'HashRef',
+    lazy => 1,
+    default => sub {
+        my $config = pit_get(
+            "gmail.com",
+            require => {
+                ssl           => 1,
+                host          => 'smtp.gmail.com',
+                port          => 465,
+                sasl_username => 'username@gmail.com',
+                sasl_password => 'password',
+            }
+        );
+    },
+);
+
+has dbh => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $home = File::HomeDir->my_home;
+        my $dedupe_fname = "$home/.mixi2gmail.db";
+        my $dbh = DBI->connect("dbi:SQLite:dbname=$dedupe_fname", '', '', {RaiseError => 1});
+        $dbh->do(q{
+            CREATE TABLE IF NOT EXISTS dedupe (
+                key VARCHAR(255)
+            );
+        });
+        $dbh;
+    }
+);
+
+has mixi => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        my $mixi = WWW::Mixi::Scraper->new(
+            email    => $self->config_mixi->{email} // die,
+            password => $self->config_mixi->{password} // die,
+            mode     => 'HTML'
+        );
+    },
+);
+
+sub run {
+    my $self = shift;
+
+    GetOptions(
+        'to=s' => \my $to_addr,
+    );
+
+    my $mixi = $self->mixi;
+    my @entries = $mixi->new_friend_diary->parse;
+    for my $entry (@entries) {
+        my $link = $entry->{link} // die;
+        next if $link =~ /\?url=/; # skip external blogs
+        next if $self->is_processed_entry($link);
+        my $full = $mixi->parse($link);
+        $self->send_mail($to_addr, $entry, $full);
+
+last if $ENV{DEBUG};
+        $self->register_deduper($link);
+        sleep 1;
+    }
+}
+
+sub send_mail {
+    my ($self, $to_addr, $simple, $entry) = @_;
+
+    my $addr = $to_addr // $self->config_gmail->{'sasl_username'} // die "missing sasl_username";
+    my $subject = "$entry->{subject} by $simple->{name}" // die;
+
+    my $html = $self->xslate->render_string(<<'...', +{ %$simple, %$entry });
+<h1>[% subject %] by [% name %]</h1>
+
+[% description | raw %]
+
+[% IF images.size() > 0 %]
+  <div>
+  [% FOR img IN images %]
+    <img src="[% img.thumb_link %]" alt="[% loop.count %]" />
+  [% END %]
+  </div>
+[% END %]
+
+<hr />
+
+<div style="text-align: right">
+<a href="[% link %]">[% time %]</a>
+</div>
+...
+    my $plain_text = $entry->{description};
+
+    my $ua = $self->mixi->{mech} // die;
+    my $resolver = Email::MIME::CreateHTML::Resolver::CustomUA->new({'ua' => $ua});
+    my $email = Email::MIME->create_html(
+        header => [
+            From    => $addr,
+            To      => $addr,
+            Subject => $subject,
+        ],
+        body      => $html,
+        text_body => $plain_text
+    );
+
+    sendmail(
+        $email,
+        {
+            transport => Email::Sender::Transport::SMTP->new(
+                %{$self->config_gmail},
+            )
+        }
+    );
+}
+
+sub is_processed_entry {
+    my ($self, $link) = @_;
+    my ($cnt) = $self->dbh->selectrow_array(q{SELECT COUNT(*) FROM dedupe WHERE key=?}, {}, $link);
+    return !!$cnt;
+}
+
+sub register_deduper {
+    my ($self, $link) = @_;
+    $self->dbh->do(q{INSERT INTO dedupe (key) VALUES (?)}, {}, $link);
+}
+
+no Mouse;
+__PACKAGE__->meta->make_immutable;
+
+# taken from https://gist.github.com/251646
+package Email::MIME::CreateHTML::Resolver::CustomUA;
+use base qw(Email::MIME::CreateHTML::Resolver);
+use Storable qw/dclone/;
+
+sub _select_resolver {
+    my ($self, $uri) = @_;
+
+    my $resolver = $self->SUPER::_select_resolver($uri);
+    return $resolver unless ($self->{ua});
+
+    my $lwp_resolver;
+    if ($resolver->isa('Email::MIME::CreateHTML::Resolver::LWP')) {
+        $lwp_resolver = $resolver;
+    } elsif ($resolver->isa('Email::MIME::CreateHTML::Resolver::Cached')) {
+        if ($resolver->{Resolver}->isa('Email::MIME::CreateHTML::Resolver::LWP')) {
+            $lwp_resolver = $resolver->{Resolver};
+        }
+    }
+
+    if ($lwp_resolver) {
+        my $ua = dclone($self->{ua});
+        $ua->default_header( 'Cache-Control' => 'no-cache' );
+        $ua->default_header( 'Pragma' => 'no-cache' );
+        $lwp_resolver->{UA} = $ua;
+    }
+
+    return $resolver;
+}
+
+package main;
+
+App::mixi2gmail->new->run();
+
+__END__
+
+=head1 SYNOPSIS
+
+    % mixi2gmail --to tokuhirom+spam@gmail.com
+
