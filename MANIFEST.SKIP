@@ -26,3 +26,11 @@ nytprof
 perltidy.ERR$
 ^README.pod$
 ^tags$
+^README.mkdn$
+^MYMETA\.
+\b_build
+\binc/
+^MANIFEST\.SKIP
+\b\.gitignore
+\.bak$
+^App-mixi2gmail-
