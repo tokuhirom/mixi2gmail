@@ -16,3 +16,4 @@ MYMETA.*
 META.json
 README
 App-mixi2gmail-*/
+^inc/

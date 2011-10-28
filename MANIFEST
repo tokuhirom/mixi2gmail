@@ -4,6 +4,8 @@ Changes
 lib/App/mixi2gmail.pm
 LICENSE
 MANIFEST			This list of files
+META.json
+META.yml
 mixi2gmail
 README
 t/00_compile.t
