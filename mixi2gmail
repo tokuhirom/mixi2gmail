@@ -19,7 +19,7 @@ use Encode;
 use File::HomeDir;
 use Getopt::Long;
 use Text::Xslate;
-use WWW::Mixi::Scraper;
+use WWW::Mixi::Scraper 0.34;
 
 has config_mixi => (
     is => 'ro',
